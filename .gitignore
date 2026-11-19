@@ -1,0 +1,17 @@
+*.ko
+*.o
+*.o.d
+*.mod.*
+*.mod
+*.symvers
+*.cmd
+*.d
+modules.order
+.tmp_versions/
+
+*.log
+umbra-build.log
+
+*.swp
+*~
+.DS_Store
